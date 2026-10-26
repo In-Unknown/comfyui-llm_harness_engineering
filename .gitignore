@@ -1,3 +1,48 @@
+# Local API sources and credentials (never publish)
+/data/
+.env
+.env.*
+!.env.example
+connections.json
+connections.*.json
+*credentials*.json
+*secrets*.json
+*.dpapi
+*.pem
+*.key
+
+# Runtime images, responses, history and resumable jobs
+/input/
+/output/
+/outputs/
+/temp/
+/tmp/
+/user/
+/cache/
+/llm_harness_image_resume/
+*.response.json
+*.log
+*.part
+
+# Python environments and tool caches
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+node_modules/
+
+# Local editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp

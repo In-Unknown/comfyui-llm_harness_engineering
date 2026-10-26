@@ -4,6 +4,8 @@ import importlib.util
 import os
 import sys
 
+WEB_DIRECTORY = "./web"
+
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
@@ -53,5 +55,12 @@ for filename in sorted(os.listdir(current_dir)):
             display_name = getattr(obj, "DISPLAY_NAME", node_id)
             NODE_CLASS_MAPPINGS[node_id] = obj
             NODE_DISPLAY_NAME_MAPPINGS[node_id] = display_name
+
+from .image_api import NODE_CLASSES as IMAGE_NODE_CLASSES
+
+for node_class in IMAGE_NODE_CLASSES:
+    schema = node_class.define_schema()
+    NODE_CLASS_MAPPINGS[schema.node_id] = node_class
+    NODE_DISPLAY_NAME_MAPPINGS[schema.node_id] = schema.display_name
 
 print(f"[comfyui-llm_harness-engineering] Loaded {len(NODE_CLASS_MAPPINGS)} nodes.")

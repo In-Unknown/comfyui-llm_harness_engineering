@@ -5,6 +5,10 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
+import urllib.error
+
+import numpy as np
 
 try:
     from aiohttp import web
@@ -15,6 +19,8 @@ except Exception:
 
 from comfy_api.latest import IO
 from comfy.model_management import throw_exception_if_processing_interrupted
+from comfy_execution.utils import get_executing_context
+from . import generation_cache
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -71,7 +77,6 @@ _setup_routes()
 
 
 def _tensor_to_png_b64(image_tensor):
-    import numpy as np
     from PIL import Image as PILImage
 
     if image_tensor is None:
@@ -108,10 +113,46 @@ def _collect_images(images):
     return b64_list
 
 
-def _post_stream(url, headers, body, timeout, fmt, node_id=None):
-    import urllib.request
-    import urllib.error
+def _redact(message, key):
+    return str(message).replace(key, "[REDACTED]") if key else str(message)
 
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Redirects can change POST to GET and forward API credentials to another host.
+        return None
+
+
+def _check_response_error(payload, key, event=""):
+    if not isinstance(payload, dict):
+        raise RuntimeError("接口返回的 JSON 不是响应对象。")
+    error = payload.get("error") or payload.get("response", {}).get("error")
+    if error or payload.get("type") in ("error", "response.failed") or payload.get("status") == "failed" or event == "error":
+        raise RuntimeError("接口返回错误：" + _redact(json.dumps(error or payload, ensure_ascii=False), key)[:800])
+
+
+def _sse_events(response):
+    event, data = "", []
+    for raw_line in response:
+        throw_exception_if_processing_interrupted()
+        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line:
+            if data:
+                yield event, "\n".join(data)
+            event, data = "", []
+        elif not line.startswith(":"):
+            field, _, value = line.partition(":")
+            if value.startswith(" "):
+                value = value[1:]
+            if field == "data":
+                data.append(value)
+            elif field == "event":
+                event = value
+    if data:
+        yield event, "\n".join(data)
+
+
+def _post_stream(url, headers, body, timeout, fmt, node_id=None):
     if "User-Agent" not in headers:
         headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -119,47 +160,53 @@ def _post_stream(url, headers, body, timeout, fmt, node_id=None):
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
+    key = headers.get("x-api-key") or headers.get("Authorization", "").removeprefix("Bearer ")
+    context = get_executing_context()
+    client_id = PromptServer.instance.client_id if _HAS_SERVER and node_id else None
+    throw_exception_if_processing_interrupted()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as r:
             content_type = r.headers.get("Content-Type", "")
             if "text/event-stream" not in content_type:
                 raw = r.read().decode("utf-8", errors="replace")
-                return json.loads(raw)
+                result = json.loads(raw)
+                _check_response_error(result, key)
+                throw_exception_if_processing_interrupted()
+                return result
 
             full_text = []
-            for line in r:
-                line = line.decode("utf-8", errors="replace").strip()
-                if not line: continue
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                        delta = ""
-                        if fmt == "Chat Completions":
-                            choices = chunk.get("choices", [])
-                            if choices:
-                                delta = choices[0].get("delta", {}).get("content", "")
-                        elif fmt == "Responses":
-                            if chunk.get("type") == "response.output_text.delta":
-                                delta = chunk.get("delta", "")
-                        elif fmt == "Anthropic Messages":
-                            if chunk.get("type") == "content_block_delta":
-                                c = chunk.get("delta", {})
-                                if c.get("type") == "text_delta":
-                                    delta = c.get("text", "")
+            finished = False
+            for event, data_str in _sse_events(r):
+                if data_str.strip() == "[DONE]":
+                    finished = True
+                    break
+                chunk = json.loads(data_str)
+                _check_response_error(chunk, key, event)
+                delta = ""
+                if fmt == "Chat Completions":
+                    choices = chunk.get("choices", [])
+                    if choices:
+                        delta = choices[0].get("delta", {}).get("content") or ""
+                        finished = finished or choices[0].get("finish_reason") is not None
+                elif fmt == "Responses":
+                    if chunk.get("type") == "response.output_text.delta":
+                        delta = chunk.get("delta", "")
+                    finished = finished or chunk.get("type") in ("response.completed", "response.incomplete")
+                elif fmt == "Anthropic Messages":
+                    if chunk.get("type") == "content_block_delta":
+                        content = chunk.get("delta", {})
+                        if content.get("type") == "text_delta":
+                            delta = content.get("text", "")
+                    finished = finished or chunk.get("type") == "message_stop"
 
-                        if delta:
-                            full_text.append(delta)
-                            if _HAS_SERVER and node_id:
-                                # 推送到前端
-                                PromptServer.instance.send_sync("llm_harness.stream", {
-                                    "node_id": node_id,
-                                    "text": delta
-                                })
-                    except json.JSONDecodeError:
-                        pass
+                if delta:
+                    full_text.append(delta)
+                    if _HAS_SERVER and node_id and client_id is not None and context is not None:
+                        PromptServer.instance.send_sync("llm_harness.stream", {
+                            "node_id": node_id, "prompt_id": context.prompt_id, "text": delta,
+                        }, client_id)
+            if not finished:
+                raise RuntimeError("流式连接在回复完成前断开，请检查接口日志；未将不完整回复传给下游。")
 
             if fmt == "Chat Completions":
                 return {"choices": [{"message": {"content": "".join(full_text)}}]}
@@ -170,14 +217,16 @@ def _post_stream(url, headers, body, timeout, fmt, node_id=None):
 
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code} 来自 {url}：{raw[:1000]}")
+        raise RuntimeError(f"HTTP {e.code}：{_redact(raw, key)[:1000]}") from None
     except urllib.error.URLError as e:
-        raise RuntimeError(f"连接失败 {url}：{e.reason}")
+        raise RuntimeError(f"连接失败：{_redact(e.reason, key)}") from None
+    except json.JSONDecodeError:
+        raise RuntimeError("接口返回的 JSON 或流式事件无效，请检查接口格式。") from None
 
 
 def _call_llm(cfg, model, prompt, system_prompt, thinking, temperature, max_tokens, timeout, images_b64, node_id=None):
     fmt = cfg.get("api_format", "Chat Completions")
-    endpoint = (cfg.get("endpoint") or "").rstrip("/")
+    endpoint = (cfg.get("endpoint") or "").strip().rstrip("/")
     api_key = cfg.get("api_key") or ""
     if not endpoint:
         raise ValueError("连接配置缺少接口地址")
@@ -214,7 +263,7 @@ def _call_llm(cfg, model, prompt, system_prompt, thinking, temperature, max_toke
         try:
             return resp["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError):
-            raise RuntimeError(f"无法解析响应：{json.dumps(resp, ensure_ascii=False)[:800]}")
+            raise RuntimeError(f"无法解析响应：{_redact(json.dumps(resp, ensure_ascii=False), api_key)[:800]}")
 
     if fmt == "Responses":
         url = endpoint + "/responses"
@@ -259,11 +308,11 @@ def _call_llm(cfg, model, prompt, system_prompt, thinking, temperature, max_toke
         if not texts and isinstance(resp.get("output_text"), str):
             texts.append(resp["output_text"])
         if not texts:
-            raise RuntimeError(f"无法解析响应：{json.dumps(resp, ensure_ascii=False)[:800]}")
+            raise RuntimeError(f"无法解析响应：{_redact(json.dumps(resp, ensure_ascii=False), api_key)[:800]}")
         return "\n".join(texts)
 
     if fmt == "Anthropic Messages":
-        url = endpoint + "/v1/messages"
+        url = endpoint + ("/messages" if endpoint.endswith("/v1") else "/v1/messages")
         headers = {
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
@@ -301,13 +350,13 @@ def _call_llm(cfg, model, prompt, system_prompt, thinking, temperature, max_toke
                 if t:
                     texts.append(t)
         if not texts:
-            raise RuntimeError(f"无法解析响应：{json.dumps(resp, ensure_ascii=False)[:800]}")
+            raise RuntimeError(f"无法解析响应：{_redact(json.dumps(resp, ensure_ascii=False), api_key)[:800]}")
         return "\n".join(texts)
 
     raise ValueError(f"未知的接口格式：{fmt}")
 
 
-class LLMRemoteReply(IO.ComfyNode):
+class LLMRemoteReply(generation_cache.CachedGenerationNode):
     """调用远程 LLM（支持图片输入；Chat Completions / Responses / Anthropic Messages）。"""
 
     @classmethod
@@ -325,6 +374,10 @@ class LLMRemoteReply(IO.ComfyNode):
             if models:
                 default_models = models
 
+        # The frontend filters by connection; backend validation must accept every configured model.
+        model_options = list(dict.fromkeys(default_models + [model for cfg in data.values()
+                             for model in (cfg.get("models") or ([cfg["model"]] if cfg.get("model") else []))]))
+
         return IO.Schema(
             node_id="llm_remote_reply",
             display_name="LLM 远程回复",
@@ -335,10 +388,12 @@ class LLMRemoteReply(IO.ComfyNode):
                 "按顺序一起发送，支持不同尺寸。每次请求先发送普通口图片，再发送合并列表。"
                 "提示词等其他输入若为执行列表，仍按项执行，每次携带完整合并图片列表。"
                 "图片按输入宽高编码为 PNG，不在本地缩放；超出服务端限制时由服务端处理或返回错误。"
+                "按全部请求输入的 SHA-256 复用历史回复，包括各图片口的原始内容与顺序。"
+                "成功回复保存在内存中，切换输入后再切回也可复用；重启 ComfyUI 后清空。"
             ),
             inputs=[
                 IO.Combo.Input("connection", display_name="连接", options=options, default=options[0]),
-                IO.Combo.Input("model", display_name="模型", options=default_models, default=default_models[0]),
+                IO.Combo.Input("model", display_name="模型", options=model_options, default=default_models[0]),
                 IO.String.Input("prompt", display_name="提示词", multiline=True, default=""),
                 IO.String.Input("system_prompt", display_name="系统提示词", multiline=True, default=""),
                 IO.Combo.Input("thinking", display_name="思考强度", options=list(_THINKING_MAP.keys()), default="关闭"),
@@ -352,18 +407,23 @@ class LLMRemoteReply(IO.ComfyNode):
                 )),
                 IO.Image.Input("image_list", display_name="列表合并图片", optional=True,
                                tooltip="整个执行列表一次性提交；包括每项内部的全部批次图片，允许不同尺寸。"),
+                IO.Boolean.Input("force_refresh", display_name="强制重新请求", default=False, optional=True,
+                                 tooltip="关闭时复用本次 ComfyUI 启动以来相同输入的回复；开启时调用 API，成功后更新缓存。可能再次计费。"),
             ],
             outputs=[IO.String.Output("text", display_name="回复文本", is_output_list=True)],
-            hidden=[IO.Hidden.unique_id],
+            hidden=[IO.Hidden.unique_id, IO.Hidden.dynprompt],
             is_input_list=True,
             accept_all_inputs=True,  # 保留旧 API 工作流的 image_1 / image_2 / image_3 接线。
         )
 
     @classmethod
     def execute(cls, connection, model, prompt, system_prompt, thinking, temperature, max_tokens, timeout,
-                images=None, image_list=None, **legacy_images):
+                images=None, image_list=None, force_refresh=False, **legacy_images):
         # Old API workflows may still send this removed setting; it no longer resizes or maps requests.
         legacy_images.pop("max_image_side", None)
+        # Older frontends also submitted these UI-only widgets as execution inputs.
+        legacy_images.pop("＋ 添加 / 编辑连接", None)
+        legacy_images.pop("stream_output", None)
         images = dict(images or {})
         for name, value in legacy_images.items():
             if name not in ("image_1", "image_2", "image_3"):
@@ -377,7 +437,7 @@ class LLMRemoteReply(IO.ComfyNode):
         # INPUT_IS_LIST 对所有输入生效；只有 image_list 不参与逐项配对。
         mapped = dict(connection=connection, model=model, prompt=prompt, system_prompt=system_prompt,
                       thinking=thinking, temperature=temperature, max_tokens=max_tokens,
-                      timeout=timeout, **images)
+                      timeout=timeout, force_refresh=force_refresh, **images)
         mapped = {name: value if isinstance(value, (list, tuple)) else [value]
                   for name, value in mapped.items()}
         if any(len(values) == 0 for values in mapped.values()):
@@ -388,18 +448,38 @@ class LLMRemoteReply(IO.ComfyNode):
             image_list = [image_list]
 
         connections = _load_connections()
+        image_list_key = generation_cache.input_key("llm_remote_reply.image_list", image_list)
         node_id = getattr(cls.hidden, 'unique_id', None)
+        if cls.hidden.dynprompt is not None:
+            node_id = cls.hidden.dynprompt.get_display_node_id(node_id)
         replies = []
         for index in range(max(len(values) for values in mapped.values())):
             throw_exception_if_processing_interrupted()
             current = {name: values[min(index, len(values) - 1)] for name, values in mapped.items()}
-            current_images = [current.pop(name) for name in images]
+            current_images = {name: current.pop(name) for name in images}
             connection_name = current.pop("connection")
             cfg = connections.get(connection_name)
             if not cfg:
                 raise ValueError(f"未找到连接「{connection_name}」。请点击节点上的「＋ 添加 / 编辑连接」按钮配置。")
-            images_b64 = _collect_images([*current_images, *image_list])
             current["prompt"] = current["prompt"] or ""
             current["system_prompt"] = current["system_prompt"] or ""
-            replies.append(_call_llm(cfg, images_b64=images_b64, node_id=node_id, **current))
+            refresh = current.pop("force_refresh")
+            cache_key = generation_cache.input_key("llm_remote_reply", {
+                "connection": connection_name, "endpoint": (cfg.get("endpoint") or "").strip().rstrip("/"),
+                "api_format": cfg.get("api_format", "Chat Completions"), "api_key": cfg.get("api_key") or "",
+                "inputs": current, "images": current_images, "image_list": image_list_key,
+            })
+
+            def generate():
+                images_b64 = _collect_images([*current_images.values(), *image_list])
+                return _call_llm(cfg, images_b64=images_b64, node_id=node_id, **current)
+
+            text, reused = generation_cache.CACHE.run(cache_key, generate, force_refresh=refresh)
+            if reused:
+                context = get_executing_context()
+                if _HAS_SERVER and node_id and context is not None and PromptServer.instance.client_id is not None:
+                    PromptServer.instance.send_sync("llm_harness.stream", {
+                        "node_id": node_id, "prompt_id": context.prompt_id, "text": text, "cached": True,
+                    }, PromptServer.instance.client_id)
+            replies.append(text)
         return IO.NodeOutput(replies)

@@ -31,7 +31,7 @@ app.registerExtension({
   async nodeCreated(node) {
     if (node.comfyClass !== "LLMHarnessImageEdit") return;
     const widget = node.addCustomWidget({
-      name: "llm_harness_total_progress", type: "llm_harness_total_progress", serialize: false,
+      name: "llm_harness_total_progress", type: "llm_harness_total_progress", serialize: false, options: { serialize: false },
       computeSize: () => [0, 32],
       draw(ctx, owner, width, y) {
         const value = owner.harnessImageProgress;

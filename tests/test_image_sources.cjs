@@ -21,7 +21,11 @@ const reply = (resolve, data = connections) => resolve({ok: true, json: async ()
     function Node() {
         this.widgets = [{name: "connection", value: "A", options: {}}, {name: "model", value: "a2", options: {}}];
     }
-    Node.prototype.addWidget = function (type, name, value, callback) { this.widgets.push({type, name, value, callback}); };
+    Node.prototype.addWidget = function (type, name, value, callback, options = {}) {
+        const widget = {type, name, value, callback, options};
+        this.widgets.push(widget);
+        return widget;
+    };
     Node.prototype.setDirtyCanvas = () => {};
     extension.beforeRegisterNodeDef(Node, {name: "LLMHarnessImageEdit"});
     const node = new Node();
@@ -44,11 +48,32 @@ const reply = (resolve, data = connections) => resolve({ok: true, json: async ()
     await tick();
     assert.equal(model.value, "b2", "Stale requests cannot overwrite current source data");
     node.onConfigure();
+    reply(pending.shift(), {A: {models: ["a1"]}});
+    await tick();
+    assert.equal(source.value, "B", "A removed source must not silently switch the API provider");
+    assert.equal(model.value, "b2");
+    node.onConfigure();
     node.onRemoved();
     reply(pending.shift());
     await tick();
     assert.equal(model.value, "b2");
     assert.equal(listeners.size, 0, "Removal cleans up focus listener");
+    for (const name of ["llm_remote_reply", "LLMHarnessImageGenerate"]) {
+        function RelatedNode() { Node.call(this); }
+        RelatedNode.prototype = Object.create(Node.prototype);
+        RelatedNode.prototype.onNodeCreated = undefined;
+        extension.beforeRegisterNodeDef(RelatedNode, {name});
+        const related = new RelatedNode();
+        related.onNodeCreated();
+        reply(pending.shift());
+        await tick();
+        assert.equal(related.widgets[1].value, "a2");
+        const buttons = related.widgets.filter(widget => widget.type === "button");
+        assert.equal(buttons.length, 2);
+        assert.ok(buttons.every(widget => widget.serialize === false && widget.options.serialize === false),
+            "Buttons must not enter saved workflows or executable prompts");
+        related.onRemoved();
+    }
     function Other() {}
     extension.beforeRegisterNodeDef(Other, {name: "MXWQ_GPTImageEdit"});
     assert.equal(Other.prototype.onNodeCreated, undefined, "Original nodes are not modified");

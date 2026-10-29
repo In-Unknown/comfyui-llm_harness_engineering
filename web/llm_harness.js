@@ -1,15 +1,28 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-async function openDialog() {
-    try {
-        const r = await fetch("/llm_harness/connections/add", { method: "POST" });
-        const j = await r.json();
-        if (!j.ok) alert("打开窗口失败：" + (j.error || "未知错误"));
-        return !!j.ok;
-    } catch (e) {
-        alert("请求失败：" + e);
-        return false;
+let promptId = null;
+let graphId = null;
+
+function findNode(executionId) {
+    let graph = app.rootGraph;
+    const path = String(executionId).split(":");
+    for (let index = 0; index < path.length; index++) {
+        const node = graph?.getNodeById(path[index]);
+        if (index === path.length - 1) return node;
+        graph = node?.subgraph;
+    }
+}
+
+function clearPreviews(graph) {
+    for (const node of graph?._nodes ?? []) {
+        if (node.type === "llm_remote_reply" && node._streamPanel) {
+            node._isExpanded = false;
+            node._streamPanel.innerText = "";
+            node.setSize([node.size[0], node.computeSize()[1]]);
+            node._forceSize?.();
+        }
+        if (node.subgraph) clearPreviews(node.subgraph);
     }
 }
 
@@ -22,49 +35,6 @@ app.registerExtension({
         nodeType.prototype.onNodeCreated = function () {
             const r = origCreated ? origCreated.apply(this, arguments) : undefined;
             const node = this;
-
-            const connWidget = node.widgets.find(w => w.name === "connection");
-            const modelWidget = node.widgets.find(w => w.name === "model");
-
-            if (connWidget && modelWidget) {
-                let cacheData = null;
-                const updateModels = async () => {
-                    try {
-                        if (!cacheData) {
-                            const res = await fetch("/llm_harness/connections");
-                            const json = await res.json();
-                            cacheData = json.connections;
-                        }
-                        const cfg = cacheData[connWidget.value];
-                        let models = [];
-                        if (cfg) {
-                            models = cfg.models || [];
-                            if (models.length === 0 && cfg.model) models = [cfg.model];
-                        }
-                        if (models.length === 0) models = ["（未配置模型）"];
-
-                        modelWidget.options.values = models;
-                        if (!models.includes(modelWidget.value)) {
-                            modelWidget.value = models[0];
-                        }
-                        node.setSize(node.size);
-                        app.graph.setDirtyCanvas(true, true);
-                    } catch (e) {
-                        console.error("[LLM Harness] failed to update models", e);
-                    }
-                };
-
-                const origCb = connWidget.callback;
-                connWidget.callback = function (value) {
-                    if (origCb) origCb.apply(this, arguments);
-                    updateModels();
-                };
-                updateModels();
-            }
-
-            node.addWidget("button", "＋ 添加 / 编辑连接", null, async () => {
-                await openDialog();
-            });
 
             // 完全复刻标准实现：外层 flex 容器，内层滚动区
             const panel = document.createElement("div");
@@ -93,6 +63,7 @@ app.registerExtension({
 
             let widget;
             widget = node.addDOMWidget("stream_output", "流式预览", panel, {
+                serialize: false,
                 hideOnZoom: false,
                 getMinHeight: () => node._isExpanded ? 160 : 0,
                 onDraw: fitPanel,
@@ -132,8 +103,9 @@ app.registerExtension({
     },
     async setup() {
         api.addEventListener("llm_harness.stream", (event) => {
+            if (event.detail.prompt_id !== promptId || app.rootGraph.id !== graphId) return;
             const { node_id, text } = event.detail;
-            const node = app.graph.getNodeById(node_id);
+            const node = findNode(node_id);
             if (node && node._streamPanel) {
                 if (!node._isExpanded) {
                     node._isExpanded = true;
@@ -146,15 +118,14 @@ app.registerExtension({
             }
         });
 
-        api.addEventListener("execution_start", () => {
-            app.graph._nodes.forEach(n => {
-                if (n.type === "llm_remote_reply" && n._streamPanel) {
-                    n._isExpanded = false;
-                    n._streamPanel.innerText = "";
-                    n.setSize([n.size[0], n.computeSize()[1]]);
-                    if (n._forceSize) n._forceSize();
-                }
-            });
+        api.addEventListener("execution_start", ({ detail }) => {
+            promptId = detail.prompt_id;
+            graphId = app.rootGraph.id;
+            clearPreviews(app.rootGraph);
         });
+    },
+    beforeConfigureGraph() {
+        promptId = null;
+        graphId = null;
     }
 });

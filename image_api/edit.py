@@ -11,12 +11,13 @@ from comfy.utils import ProgressBar
 from comfy.model_management import throw_exception_if_processing_interrupted
 from comfy_execution.utils import get_executing_context
 from server import PromptServer
+from .. import generation_cache
 from .checkpoint import BatchCheckpoint
 from .connections import resolve_connection, source_inputs, redact
 from .request import request_image
 
 
-class APIImageEdit(io.ComfyNode):
+class APIImageEdit(generation_cache.CachedGenerationNode):
     @classmethod
     def define_schema(cls):
         image_template = io.Autogrow.TemplateNames(
@@ -27,7 +28,7 @@ class APIImageEdit(io.ComfyNode):
         return io.Schema(
             node_id="LLMHarnessImageEdit", display_name="API图片编辑",
             category="llm_harness/image", not_idempotent=True, has_intermediate_output=True, is_input_list=True,
-            description="从来源管理选择接口、Key 和模型，通过 /images/edits 的 JSON 图片协议编辑图片。图片输入口随连接自动增加，最多 100 路（实际支持数量以接口为准）。输入图像1是待编辑主图，其余图片的用途请在提示词中说明。主图批次逐张编辑并按顺序输出，显示完成比例。成功图片立即保存到 Temp 和 user/llm_harness_image_resume；相同来源及输入自动复用，失败后只续做缺失项。开启重新生成可创建新一轮结果并保留旧备份。返回尺寸不一致时等比缩放并补黑边到首张尺寸。",
+            description="从来源管理选择接口、Key 和模型，通过 /images/edits 的 JSON 图片协议编辑图片。图片输入口随连接自动增加，最多 100 路（实际支持数量以接口为准）。输入图像1是待编辑主图，其余图片的用途请在提示词中说明。主图批次逐张编辑并按顺序输出，显示完成比例。全部输入相同时复用本次启动以来的成功图片，失败后只续做缺失项。重启清空自动复用记录，Temp 和 user/llm_harness_image_resume 中的图片备份保留。开启重新生成可创建新一轮结果。返回尺寸不一致时等比缩放并补黑边到首张尺寸。",
             inputs=source_inputs() + [
                 io.Autogrow.Input(
                     "images", template=image_template,
@@ -40,7 +41,7 @@ class APIImageEdit(io.ComfyNode):
                 io.Combo.Input("quality", options=["auto", "low", "medium", "high"], default="auto", optional=True),
                 io.Boolean.Input("fixed_reference", display_name="固定参考", default=False, optional=True, tooltip="开启：输入图像1的每张主图共用其余输入口各自的第一张图片。关闭：按批次序号配对，图片不足的位置不发送该输入口的图片。"),
                 io.Int.Input("max_concurrency", display_name="并发请求数", default=2, min=1, max=8, optional=True, tooltip="同时发送的独立编辑请求数；每张主图请求一次并分别计费，遇到限流可设为 1。"),
-                io.Boolean.Input("force_regenerate", display_name="重新生成", default=False, optional=True, tooltip="关闭：输入不变时复用已完成的图片，只续做缺失项，包括重启后。开启：每次运行新建一轮生成，不使用旧结果。续做前请关闭。"),
+                io.Boolean.Input("force_regenerate", display_name="重新生成", default=False, optional=True, tooltip="关闭：复用本次启动以来相同输入的成功图片，只续做缺失项；重启清空自动复用记录。开启：每次请求新结果，成功后更新对应缓存。续做前请关闭。"),
             ], outputs=[io.Image.Output(display_name="IMAGE", is_output_list=True)], hidden=[io.Hidden.unique_id, io.Hidden.dynprompt],
         )
 
@@ -107,11 +108,28 @@ class APIImageEdit(io.ComfyNode):
     def _execute_batch(cls, images, prompt, model, size, timeout_seconds, known_mask, quality,
                        fixed_reference, max_concurrency, force_regenerate, key, endpoint, source, progress,
                        batch_index, completed_before, total):
-        payloads = cls._build_batch_payloads(images, prompt, model, size, known_mask, quality, fixed_reference)
+        batch_key = generation_cache.input_key("LLMHarnessImageEdit", {
+            "connection": source, "endpoint": endpoint, "api_key": key, "images": images,
+            "prompt": prompt, "model": model, "size": size, "timeout_seconds": timeout_seconds,
+            "known_mask": known_mask, "quality": quality, "fixed_reference": fixed_reference,
+            "max_concurrency": max_concurrency,
+        })
+        count = len(images["输入图像1"])
+        if count == 0:
+            raise ValueError("主图批次不能为空。")
+        item_keys = [generation_cache.input_key("LLMHarnessImageEdit.item", {"batch": batch_key, "index": index})
+                     for index in range(count)]
         node_id = cls.hidden.unique_id if cls.hidden is not None else None
-        checkpoint = BatchCheckpoint(payloads, key, node_id, force_regenerate, endpoint=endpoint, source=source)
-        results = [checkpoint.load(index) for index in range(len(payloads))]
+        checkpoint = BatchCheckpoint(batch_key, force_regenerate)
+        results = []
+        for index, item_key in enumerate(item_keys):
+            content = None if force_regenerate else generation_cache.CACHE.get(item_key)
+            result = generation_cache.decode_image(content) if content is not None else None
+            if result is not None:
+                checkpoint.save(index, result)
+            results.append(result)
         missing = [index for index, result in enumerate(results) if result is None]
+        payloads = cls._build_batch_payloads(images, prompt, model, size, known_mask, quality, fixed_reference) if missing else []
         reused = len(results) - len(missing)
         context = get_executing_context()
         server = PromptServer.instance
@@ -157,14 +175,20 @@ class APIImageEdit(io.ComfyNode):
             checkpoint.progress(len(results), completed, active, len(failures), waiting, reused)
 
         def generate(index):
-            result = request_image(endpoint, "edits", payloads[index], key, timeout_seconds, checkpoint.response_path(index))
+            def request_or_resume():
+                saved = checkpoint.load(index)
+                if saved is not None:
+                    return saved
+                return request_image(endpoint, "edits", payloads[index], key, timeout_seconds, checkpoint.response_path(index))
+
+            result, _ = generation_cache.cached_image(item_keys[index], request_or_resume, force_refresh=force_regenerate)
             # Save inside the worker so an interrupted main loop cannot lose a success.
             checkpoint.save(index, result)
             publish_preview(index)
             return result
 
         report(0, len(missing))
-        workers = max(1, min(int(max_concurrency), 8, len(payloads)))
+        workers = max(1, min(int(max_concurrency), 8, count))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {}
             next_item = 0

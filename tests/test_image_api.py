@@ -18,10 +18,7 @@ import folder_paths
 import torch
 from PIL import Image
 from server import PromptServer
-from image_api import connections, request
-from image_api.checkpoint import BatchCheckpoint
-from image_api.edit import APIImageEdit
-from image_api.generation import APIImageGenerate
+from harness_test_support import connections, request, BatchCheckpoint, APIImageEdit, APIImageGenerate, generation_cache
 
 
 def encoded_image(color="red"):
@@ -32,6 +29,7 @@ def encoded_image(color="red"):
 
 class ImageAPITests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(generation_cache, "CACHE", generation_cache.GenerationCache()))
         self.temp = self.enterContext(tempfile.TemporaryDirectory())
         self.config = {
             "first": {"endpoint": "https://first.invalid/v1", "api_key": "secret-A", "models": ["image-A"]},
@@ -66,13 +64,14 @@ class ImageAPITests(unittest.TestCase):
         self.assertEqual([len(v["images"]) for v in fixed], [2, 2])
         self.assertEqual(fixed[0]["quality"], "high")
 
-    def execute_edit(self, source="first", regenerate=False):
+    def execute_edit(self, source="first", regenerate=False, node_id="test-edit", **overrides):
         raw = {"images.输入图像1": torch.zeros(2,3,4,3), "connection": source,
                "model": "image-A", "prompt": "edit", "size": "auto", "timeout_seconds": 60,
                "max_concurrency": 1, "force_regenerate": regenerate}
-        inputs, missing, data = execution.get_input_data(raw, APIImageEdit, "test-edit")
+        raw.update(overrides)
+        inputs, missing, data = execution.get_input_data(raw, APIImageEdit, node_id)
         self.assertFalse(missing)
-        return asyncio.run(execution.get_output_data("test", "test-edit", APIImageEdit, inputs, v3_data=data))
+        return asyncio.run(execution.get_output_data("test", node_id, APIImageEdit, inputs, v3_data=data))
 
     def test_executor_resume_and_source_switch(self):
         result = self.execute_edit()
@@ -88,10 +87,10 @@ class ImageAPITests(unittest.TestCase):
         self.assertEqual(self.post.call_count, 6)
 
     def test_checkpoint_identity_and_secret_not_written(self):
-        base = dict(payloads=[{"model":"x"}], key="secret-A", node_id="1", endpoint="https://a.invalid/v1", source="a")
-        first = BatchCheckpoint(**base)
+        base = dict(model="x", key="secret-A", endpoint="https://a.invalid/v1", source="a")
+        first = BatchCheckpoint(generation_cache.input_key("LLMHarnessImageEdit", base))
         for changed in ({"endpoint":"https://b.invalid/v1"},{"source":"b"},{"key":"secret-B"}):
-            self.assertNotEqual(first.directory, BatchCheckpoint(**(base|changed)).directory)
+            self.assertNotEqual(first.directory, BatchCheckpoint(generation_cache.input_key("LLMHarnessImageEdit", base|changed)).directory)
         for path in Path(self.temp).rglob("*.json"):
             self.assertNotIn("secret-", path.read_text())
 
@@ -128,6 +127,39 @@ class ImageAPITests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 APIImageGenerate.execute("first","image-A","draw","auto","auto",60)
         self.post.assert_not_called()
+
+    def test_failed_batch_retries_only_missing_images(self):
+        success = self.post.return_value
+        self.post.side_effect = [success, Mock(status_code=429, json=lambda: {"error": {"message": "rate limit"}})]
+        images = {"images.输入图像1": torch.zeros(3, 3, 4, 3)}
+        with self.assertRaisesRegex(RuntimeError, "1/3"):
+            self.execute_edit(**images)
+        self.assertEqual(self.post.call_count, 2, "Stop dispatching after failure")
+        self.post.side_effect = None
+        result = self.execute_edit(**images)
+        self.assertEqual(self.post.call_count, 4, "The saved first image must not be submitted again")
+        self.assertEqual(tuple(result[0][0][0].shape), (3, 3, 4, 3))
+
+    def test_frontend_only_fields_are_filtered_by_image_nodes(self):
+        self.execute_edit(**{"添加 / 编辑来源": None, "刷新来源": None, "llm_harness_total_progress": "old progress"})
+        self.assertEqual(self.post.call_count, 2)
+        raw = {"connection": "first", "model": "image-A", "prompt": "draw", "size": "auto", "quality": "auto",
+               "timeout_seconds": 60, "添加 / 编辑来源": None, "刷新来源": None}
+        inputs, missing, data = execution.get_input_data(raw, APIImageGenerate, "test-generate")
+        self.assertFalse(missing)
+        asyncio.run(execution.get_output_data("test", "test-generate", APIImageGenerate, inputs, v3_data=data))
+        self.assertEqual(self.post.call_count, 3)
+
+    def test_failed_image_download_resumes_from_saved_response(self):
+        self.post.return_value = Mock(status_code=200, json=lambda: {"data": [{"url": "https://cdn.invalid/image.png"}]})
+        path = Path(self.temp) / "response.json"
+        with self.assertRaises(RuntimeError):
+            request.request_image("https://a.invalid/v1", "edits", {}, "secret-A", 60, path)
+        self.get.side_effect = None
+        self.get.return_value = Mock(content=base64.b64decode(encoded_image()), raise_for_status=lambda: None)
+        image = request.request_image("https://a.invalid/v1", "edits", {}, "secret-A", 60, path)
+        self.assertEqual(image.size, (4, 3))
+        self.assertEqual(self.post.call_count, 1)
 
 
 if __name__ == "__main__":

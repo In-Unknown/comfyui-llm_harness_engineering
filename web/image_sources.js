@@ -3,7 +3,8 @@ import { app } from "../../scripts/app.js";
 app.registerExtension({
     name: "LLMHarness.ImageSources",
     beforeRegisterNodeDef(nodeType, nodeData) {
-        if (!["LLMHarnessImageEdit", "LLMHarnessImageGenerate"].includes(nodeData.name)) return;
+        if (!["llm_remote_reply", "LLMHarnessImageEdit", "LLMHarnessImageGenerate"].includes(nodeData.name)) return;
+        const isTextNode = nodeData.name === "llm_remote_reply";
         const created = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function (...args) {
             const result = created?.apply(this, args);
@@ -22,7 +23,14 @@ app.registerExtension({
                     if (removed || current !== revision) return;
                     const names = Object.keys(connections).sort();
                     source.options.values = names.length ? names : ["（请添加来源）"];
-                    if (!names.includes(source.value)) source.value = source.options.values[0];
+                    if (!names.includes(source.value)) {
+                        if (source.value && !source.value.startsWith("（")) {
+                            source.options.values = [source.value, ...names];
+                            node.setDirtyCanvas(true, true);
+                            return;
+                        }
+                        source.value = source.options.values[0];
+                    }
                     const cfg = connections[source.value];
                     const models = cfg?.models?.length ? cfg.models : cfg?.model ? [cfg.model] : ["（未配置模型）"];
                     model.options.values = models;
@@ -37,7 +45,7 @@ app.registerExtension({
                 changed?.apply(this, values);
                 void refresh();
             };
-            node.addWidget("button", "添加 / 编辑来源", null, async () => {
+            const editButton = node.addWidget("button", isTextNode ? "＋ 添加 / 编辑连接" : "添加 / 编辑来源", null, async () => {
                 try {
                     const response = await fetch("/llm_harness/connections/add", { method: "POST" });
                     const data = await response.json();
@@ -45,8 +53,10 @@ app.registerExtension({
                 } catch (error) {
                     alert(`打开来源管理失败：${error.message}`);
                 }
-            });
-            node.addWidget("button", "刷新来源", null, refresh);
+            }, { serialize: false });
+            editButton.serialize = false;
+            const refreshButton = node.addWidget("button", isTextNode ? "刷新连接" : "刷新来源", null, refresh, { serialize: false });
+            refreshButton.serialize = false;
             const configure = node.onConfigure;
             node.onConfigure = function (...values) {
                 const value = configure?.apply(this, values);

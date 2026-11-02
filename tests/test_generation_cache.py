@@ -56,8 +56,10 @@ class GenerationCacheTests(unittest.TestCase):
         return APIImageGenerate.execute(**(args | overrides))[0]
 
     def test_all_registered_generators_share_the_foundation(self):
-        self.assertEqual(set(pack.NODE_CLASS_MAPPINGS), {"llm_remote_reply", "LLMHarnessImageEdit", "LLMHarnessImageGenerate"})
-        for node in pack.NODE_CLASS_MAPPINGS.values():
+        self.assertEqual(set(pack.NODE_CLASS_MAPPINGS), {"llm_remote_reply", "LLMHarnessImageEdit", "LLMHarnessImageGenerate",
+                                                       "LLMHarnessBooleanReturn", "LLMHarnessReplyRetry"})
+        for name in ("llm_remote_reply", "LLMHarnessImageEdit", "LLMHarnessImageGenerate"):
+            node = pack.NODE_CLASS_MAPPINGS[name]
             self.assertTrue(issubclass(node, generation_cache.CachedGenerationNode))
             module = sys.modules[node.__module__]
             self.assertIs(module.generation_cache, generation_cache)

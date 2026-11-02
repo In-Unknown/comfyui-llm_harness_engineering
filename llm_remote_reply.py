@@ -1,5 +1,6 @@
 """LLM 远程回复 - 调用远程 LLM API 的 ComfyUI 节点（支持多图、多模型、流式返回）。"""
 import base64
+from dataclasses import dataclass, field
 import io as _io
 import json
 import os
@@ -29,6 +30,21 @@ _CONNECTIONS_FILE = os.path.join(_DATA_DIR, "connections.json")
 _DIALOG_SCRIPT = os.path.join(_HERE, "scripts", "harness_dialog.py")
 
 _THINKING_MAP = {"关闭": "off", "低": "low", "中": "medium", "高": "high"}
+SCHEDULE = IO.Custom("LLM_HARNESS_SCHEDULE")
+
+
+@dataclass(frozen=True)
+class ReplySchedule:
+    source_id: str
+    connection: str = field(repr=False)
+    request: dict = field(repr=False)
+    images_b64: tuple = field(repr=False)
+    text: str = field(repr=False)
+    history: tuple = field(default=(), repr=False)
+
+
+def _retry_feedback(error):
+    return "上一次回复未通过校验，错误信息：\n" + error + "\n请结合原始要求和以上对话重新生成完整回复，修正这些错误。"
 
 
 def _load_connections():
@@ -224,7 +240,7 @@ def _post_stream(url, headers, body, timeout, fmt, node_id=None):
         raise RuntimeError("接口返回的 JSON 或流式事件无效，请检查接口格式。") from None
 
 
-def _call_llm(cfg, model, prompt, system_prompt, thinking, temperature, max_tokens, timeout, images_b64, node_id=None):
+def _call_llm(cfg, model, prompt, system_prompt, thinking, temperature, max_tokens, timeout, images_b64, node_id=None, history=()):
     fmt = cfg.get("api_format", "Chat Completions")
     endpoint = (cfg.get("endpoint") or "").strip().rstrip("/")
     api_key = cfg.get("api_key") or ""
@@ -251,6 +267,9 @@ def _call_llm(cfg, model, prompt, system_prompt, thinking, temperature, max_toke
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": user_content})
+        for previous, error in history:
+            messages.extend([{"role": "assistant", "content": previous},
+                             {"role": "user", "content": _retry_feedback(error)}])
         body = {
             "model": model,
             "messages": messages,
@@ -285,6 +304,11 @@ def _call_llm(cfg, model, prompt, system_prompt, thinking, temperature, max_toke
                 "content": content_list
             }
         ]
+        for previous, error in history:
+            input_items.extend([
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": previous}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": _retry_feedback(error)}]},
+            ])
         body = {
             "model": model,
             "input": input_items,
@@ -335,6 +359,9 @@ def _call_llm(cfg, model, prompt, system_prompt, thinking, temperature, max_toke
             "max_tokens": int(max_tokens),
             "messages": [{"role": "user", "content": content_blocks}],
         }
+        for previous, error in history:
+            body["messages"].extend([{"role": "assistant", "content": previous},
+                                     {"role": "user", "content": _retry_feedback(error)}])
         if system_prompt:
             body["system"] = system_prompt
         if effort and effort != "off":
@@ -390,6 +417,8 @@ class LLMRemoteReply(generation_cache.CachedGenerationNode):
                 "图片按输入宽高编码为 PNG，不在本地缩放；超出服务端限制时由服务端处理或返回错误。"
                 "按全部请求输入的 SHA-256 复用历史回复，包括各图片口的原始内容与顺序。"
                 "成功回复保存在内存中，切换输入后再切回也可复用；重启 ComfyUI 后清空。"
+                "调度口可直接连接布尔条件返回，对回复做校验并携带错误上下文重试；"
+                "后续处理请使用布尔条件返回的回复输出。详见节点帮助。"
             ),
             inputs=[
                 IO.Combo.Input("connection", display_name="连接", options=options, default=options[0]),
@@ -410,7 +439,9 @@ class LLMRemoteReply(generation_cache.CachedGenerationNode):
                 IO.Boolean.Input("force_refresh", display_name="强制重新请求", default=False, optional=True,
                                  tooltip="关闭时复用本次 ComfyUI 启动以来相同输入的回复；开启时调用 API，成功后更新缓存。可能再次计费。"),
             ],
-            outputs=[IO.String.Output("text", display_name="回复文本", is_output_list=True)],
+            outputs=[IO.String.Output("text", display_name="回复文本", is_output_list=True),
+                     SCHEDULE.Output("schedule", display_name="调度", is_output_list=True,
+                                     tooltip="直接连接布尔条件返回的调度输入。每次校验只支持一条回复；多项执行列表请先分包。")],
             hidden=[IO.Hidden.unique_id, IO.Hidden.dynprompt],
             is_input_list=True,
             accept_all_inputs=True,  # 保留旧 API 工作流的 image_1 / image_2 / image_3 接线。
@@ -441,7 +472,7 @@ class LLMRemoteReply(generation_cache.CachedGenerationNode):
         mapped = {name: value if isinstance(value, (list, tuple)) else [value]
                   for name, value in mapped.items()}
         if any(len(values) == 0 for values in mapped.values()):
-            return IO.NodeOutput([])
+            return IO.NodeOutput([], [])
         if image_list is None:
             image_list = []
         elif not isinstance(image_list, (list, tuple)):
@@ -450,9 +481,18 @@ class LLMRemoteReply(generation_cache.CachedGenerationNode):
         connections = _load_connections()
         image_list_key = generation_cache.input_key("llm_remote_reply.image_list", image_list)
         node_id = getattr(cls.hidden, 'unique_id', None)
+        source_id = node_id
+        needs_schedule = False
         if cls.hidden.dynprompt is not None:
             node_id = cls.hidden.dynprompt.get_display_node_id(node_id)
+            needs_schedule = any(
+                value == [source_id, 1]
+                for key in cls.hidden.dynprompt.all_node_ids()
+                for value in cls.hidden.dynprompt.get_node(key).get("inputs", {}).values()
+                if isinstance(value, list)
+            )
         replies = []
+        schedules = []
         for index in range(max(len(values) for values in mapped.values())):
             throw_exception_if_processing_interrupted()
             current = {name: values[min(index, len(values) - 1)] for name, values in mapped.items()}
@@ -470,9 +510,12 @@ class LLMRemoteReply(generation_cache.CachedGenerationNode):
                 "inputs": current, "images": current_images, "image_list": image_list_key,
             })
 
+            encoded_images = None
+
             def generate():
-                images_b64 = _collect_images([*current_images.values(), *image_list])
-                return _call_llm(cfg, images_b64=images_b64, node_id=node_id, **current)
+                nonlocal encoded_images
+                encoded_images = _collect_images([*current_images.values(), *image_list])
+                return _call_llm(cfg, images_b64=encoded_images, node_id=node_id, **current)
 
             text, reused = generation_cache.CACHE.run(cache_key, generate, force_refresh=refresh)
             if reused:
@@ -482,4 +525,10 @@ class LLMRemoteReply(generation_cache.CachedGenerationNode):
                         "node_id": node_id, "prompt_id": context.prompt_id, "text": text, "cached": True,
                     }, PromptServer.instance.client_id)
             replies.append(text)
-        return IO.NodeOutput(replies)
+            schedule = None
+            if needs_schedule:
+                if encoded_images is None:
+                    encoded_images = _collect_images([*current_images.values(), *image_list])
+                schedule = ReplySchedule(source_id, connection_name, current, tuple(encoded_images), text)
+            schedules.append(schedule)
+        return IO.NodeOutput(replies, schedules)

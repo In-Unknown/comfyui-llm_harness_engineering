@@ -110,7 +110,9 @@ class ImageInputTests(unittest.TestCase):
         mapped.update(inputs)
         outputs, _, _, _ = asyncio.run(execution.get_output_data(
             "image-input-test", node_id, reply.LLMRemoteReply, mapped, v3_data=v3_data))
-        return outputs
+        self.assertEqual(len(outputs), 2)
+        self.assertEqual(len(outputs[0]), len(outputs[1]))
+        return outputs[:1]
 
     def test_merge_different_sizes_and_nested_batches_in_all_api_formats(self):
         for fmt in ("Chat Completions", "Responses", "Anthropic Messages"):
